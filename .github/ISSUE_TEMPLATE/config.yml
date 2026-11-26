@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问题 / Q&A
+    url: https://github.com/XiaoYouChR/Ghost-Downloader-3/discussions/categories/求助-q-a
+    about: 使用问题、配置问题请到 Discussions 提问
+  - name: 功能建议 / Ideas
+    url: https://github.com/XiaoYouChR/Ghost-Downloader-3/discussions/categories/功能建议-ideas
+    about: 功能建议请先到 Discussions 讨论
+  - name: Translations
+    url: https://github.com/XiaoYouChR/Ghost-Downloader-3/discussions/categories/translations
+    about: Request new languages on Discussions or translate on Crowdin

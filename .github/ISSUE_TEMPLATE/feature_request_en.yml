@@ -1,0 +1,45 @@
+name: Feature Request (EN)
+description: Suggest an idea or improvement
+title: "[Feature] "
+labels:
+  - "✨Enhancement"
+body:
+- type: markdown
+  attributes:
+    value: |
+      Explain your use case and pain points in your own words. **Do not use AI to write feature specs or technical proposals**; direct translation only. Violating issues may be closed directly.
+
+- type: checkboxes
+  id: no-duplicate
+  attributes:
+    label: Checklist
+    options:
+      - label: I have searched existing issues and Discussions to confirm this is not a duplicate
+        required: true
+      - label: This issue is written by me without AI-generated specs or technical proposals
+        required: true
+
+- type: textarea
+  id: problem-description
+  attributes:
+    label: Problem description
+    description: What problem are you trying to solve? What difficulty does the current app cause without this feature?
+  validations:
+    required: true
+
+- type: textarea
+  id: solution-description
+  attributes:
+    label: Proposed solution
+    description: Expected UX or behavior, no technical implementation needed
+
+- type: textarea
+  id: alternatives
+  attributes:
+    label: Alternatives
+
+- type: textarea
+  id: additional-info
+  attributes:
+    label: Additional information
+    render: markdown

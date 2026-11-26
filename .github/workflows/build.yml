@@ -1,0 +1,1273 @@
+name: Build / Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'Build Target'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - 'windows'
+          - 'macos'
+          - 'linux'
+          - 'android'
+          - 'all'
+      create_release:
+        description: 'Create Release'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      package_installer:
+        description: 'Package Installer (Windows)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      sign_artifact:
+        description: 'Sign Artifact'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      generate_patch:
+        description: 'Generate Patch'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      patch_base:
+        description: 'Patch Base (e.g. 4.4.0, empty = previous release)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/test.yml
+    secrets:
+      ANDROID_REPO_TOKEN: ${{ secrets.ANDROID_REPO_TOKEN }}
+
+  prepare:
+    needs: [test]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      patch_base: ${{ steps.patch_base.outputs.patch_base }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(python3 -c "exec(open('app/config/constants.py').read()); print(VERSION)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION"
+
+      - name: Find previous release
+        id: previous
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.version.outputs.version }}
+        run: |
+          PREV_TAG=$(gh release list --json tagName --jq "[.[].tagName | select(. != \"$TAG\")][0] // empty")
+          echo "tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+          echo "PREV_TAG=$PREV_TAG"
+
+      - name: Resolve patch base
+        id: patch_base
+        if: ${{ github.event.inputs.create_release == 'true' && github.event.inputs.generate_patch == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ github.event.inputs.patch_base }}
+          PREV_TAG: ${{ steps.previous.outputs.tag }}
+        run: |
+          if [ -n "$REQUESTED" ]; then
+            BASE_TAG="v$REQUESTED"
+          elif [ -n "$PREV_TAG" ]; then
+            BASE_TAG="$PREV_TAG"
+          else
+            echo "No previous release, skipping patch"; exit 0
+          fi
+
+          ASSET_COUNT=$(gh release view "$BASE_TAG" --json assets --jq '[.assets[].name | select(test("(Windows-x86_64\\.zip|macOS-(arm64|x86_64)\\.dmg)$"))] | length')
+          if [ "$ASSET_COUNT" != 3 ]; then
+            if [ -n "$REQUESTED" ]; then echo "::error::$BASE_TAG is missing desktop assets"; exit 1; fi
+            echo "$BASE_TAG is missing desktop assets, skipping patch"; exit 0
+          fi
+
+          echo "patch_base=${BASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "PATCH_BASE=${BASE_TAG#v}"
+
+      - name: Create tag and release
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="v$VERSION"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            PREV_TAG="${{ steps.previous.outputs.tag }}"
+            BODY=""
+            if [ -n "$PREV_TAG" ]; then
+              BODY="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+            fi
+            PRERELEASE_FLAG=""
+            if [[ "$VERSION" == *-* ]]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+            gh release create "$TAG" --title "$TAG" --notes "$BODY" --latest $PRERELEASE_FLAG
+          fi
+
+  build-windows:
+    needs: [prepare]
+    permissions:
+      actions: read
+      contents: write
+    if: ${{ github.event.inputs.build_target == 'windows' || github.event.inputs.build_target == 'all' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: windows-2022
+            msvc_arch: x64
+            hdiff_arch: windows64
+            installer_arch: x64compatible and not arm64
+          - architecture: arm64
+            runner: windows-11-arm
+            msvc_arch: ARM64
+            hdiff_arch: windows_arm64
+            installer_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Install dependencies
+        run: |
+          uv python install 3.13
+          uv sync ${{ matrix.architecture == 'arm64' && '--no-install-package libtorrent' || '' }}
+
+      - name: Read libtorrent version
+        if: ${{ matrix.architecture == 'arm64' }}
+        id: libtorrent
+        shell: pwsh
+        run: |
+          $version = uv run --no-sync python -c "import tomllib; print(next(p['version'] for p in tomllib.load(open('uv.lock', 'rb'))['package'] if p['name'] == 'libtorrent'))"
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "python=$((Get-Content .python-version).Trim())" >> $env:GITHUB_OUTPUT
+
+      - name: Install libtorrent wheel
+        if: ${{ matrix.architecture == 'arm64' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: XiaoYouChR/libtorrent-python-win-arm64
+          PREFIX: v${{ steps.libtorrent.outputs.version }}-py${{ steps.libtorrent.outputs.python }}-
+        run: |
+          $tag = gh release list -R $env:REPO --limit 1000 --json tagName --jq '.[].tagName' | Where-Object { $_.StartsWith($env:PREFIX) } | Sort-Object { [int]$_.Substring($env:PREFIX.Length) } | Select-Object -Last 1
+          if (-not $tag) {
+            throw "No $env:PREFIX* wheel in $env:REPO, run Build there first"
+          }
+          gh release download $tag -R $env:REPO -p "*.whl" -D libtorrent-wheel
+          $wheel = Get-ChildItem libtorrent-wheel/*.whl
+          gh release verify-asset $tag $wheel.FullName -R $env:REPO
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          uv pip install $wheel.FullName
+
+      # runner 没有 ARM64 的 VC++ 运行库，Nuitka 要打包它
+      - name: Install VC++ runtime
+        if: ${{ matrix.architecture == 'arm64' }}
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://aka.ms/vc14/vc_redist.arm64.exe" -OutFile vc_redist.arm64.exe
+          Start-Process vc_redist.arm64.exe -ArgumentList "/install", "/quiet", "/norestart" -Wait
+
+      - name: Build with Nuitka
+        run: |
+          echo "VERSION=${{ needs.prepare.outputs.version }}" >> $env:GITHUB_ENV
+          (Get-Content scripts/Ghost-Downloader-3.iss) -replace 'APPLICATION_VERSION', '${{ needs.prepare.outputs.version }}' -replace 'APPLICATION_ARCHITECTURES', '${{ matrix.installer_arch }}' | Set-Content scripts/Ghost-Downloader-3.iss
+          uv run --no-sync scripts/deploy.py
+
+      - name: Build updater
+        shell: pwsh
+        run: |
+          cmake -B build-updater -A ${{ matrix.msvc_arch }} tools/updater
+          cmake --build build-updater --config Release
+          Copy-Item build-updater/Release/updater.exe dist/Ghost-Downloader-3.dist/
+
+      - name: Build ghd
+        shell: pwsh
+        run: |
+          cmake -B build-ghd -A ${{ matrix.msvc_arch }} tools/ghd
+          cmake --build build-ghd --config Release
+          New-Item -ItemType Directory -Force dist/Ghost-Downloader-3.dist/bin
+          Copy-Item build-ghd/Release/ghd.exe dist/Ghost-Downloader-3.dist/bin/
+
+      - name: Download HDiffPatch
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/sisong/HDiffPatch/releases/download/v5.1.3/hdiffpatch_v5.1.3_bin_${{ matrix.hdiff_arch }}.zip" -OutFile hdiffpatch.zip
+          Expand-Archive hdiffpatch.zip -DestinationPath hdiffpatch
+          Copy-Item hdiffpatch/${{ matrix.hdiff_arch }}/hpatchz.exe dist/Ghost-Downloader-3.dist/
+
+      - name: Prepare For Sign
+        if: ${{ github.event.inputs.sign_artifact == 'true' }}
+        run: |
+          mv dist/Ghost-Downloader-3.dist dist/Ghost-Downloader-3-Unsigned.dist
+
+      - name: upload-unsigned-artifact
+        if: ${{ github.event.inputs.sign_artifact == 'true' }}
+        id: upload-unsigned-artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}-Unsigned
+          path: dist/Ghost-Downloader-3-Unsigned.dist
+
+      - name: Sign binaries
+        if: ${{ github.event.inputs.sign_artifact == 'true' }}
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: 'Ghost-Downloader-3'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'binaries'
+          github-artifact-id: '${{ steps.upload-unsigned-artifact.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'dist/Ghost-Downloader-3.dist'
+
+      - name: Download Inno Setup Translation Files
+        if: ${{ github.event.inputs.create_release == 'true' || github.event.inputs.package_installer == 'true' }}
+        run: uv run --no-sync python scripts/fetch_installer_languages.py
+
+      - name: Build Installer
+        if: ${{ github.event.inputs.create_release == 'true' || github.event.inputs.package_installer == 'true' }}
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.8
+        with:
+          path: scripts/Ghost-Downloader-3.iss
+
+      - name: Upload unsigned installer
+        if: ${{ github.event.inputs.sign_artifact == 'true' && (github.event.inputs.create_release == 'true' || github.event.inputs.package_installer == 'true') }}
+        id: upload-unsigned-installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}-Installer-Unsigned
+          path: dist/Ghost-Downloader-v${{ env.VERSION }}-Windows-Setup.exe
+
+      - name: Sign installer
+        if: ${{ github.event.inputs.sign_artifact == 'true' && (github.event.inputs.create_release == 'true' || github.event.inputs.package_installer == 'true') }}
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: 'Ghost-Downloader-3'
+          signing-policy-slug: 'release-signing'
+          artifact-configuration-slug: 'installer'
+          github-artifact-id: '${{ steps.upload-unsigned-installer.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'dist'
+
+      - name: Rename Installer
+        if: ${{ github.event.inputs.create_release == 'false' && github.event.inputs.package_installer == 'true' }}
+        shell: pwsh
+        run: |
+          mv dist/Ghost-Downloader-v${{ env.VERSION }}-Windows-Setup.exe dist/Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}-Setup.exe
+
+      - name: Upload Installer
+        if: ${{ github.event.inputs.create_release == 'false' && github.event.inputs.package_installer == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}-Setup
+          path: dist/Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}-Setup.exe
+
+      - name: Package release files
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        shell: pwsh
+        run: |
+          Push-Location dist/Ghost-Downloader-3.dist
+          7z a -tzip -mx=9 -m0=LZMA "$env:GITHUB_WORKSPACE/Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}.zip" *
+          Pop-Location
+          mv dist/Ghost-Downloader-v${{ env.VERSION }}-Windows-Setup.exe dist/Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}-Setup.exe
+
+      - name: Generate patch
+        if: ${{ needs.prepare.outputs.patch_base != '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $baseVer = "${{ needs.prepare.outputs.patch_base }}"
+          $baseAssets = gh release view "v$baseVer" --json assets --jq '.assets[].name'
+          if ($baseAssets -notcontains "Ghost-Downloader-v$baseVer-Windows-${{ matrix.architecture }}.zip") {
+            Write-Output "v$baseVer has no Windows-${{ matrix.architecture }} package, skipping patch"; exit 0
+          }
+
+          New-Item -ItemType Directory -Path prev -Force
+          gh release download "v$baseVer" -p "*Windows-${{ matrix.architecture }}.zip" -D prev/
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $prevZip = Get-ChildItem prev/*.zip | Select-Object -First 1
+
+          New-Item -ItemType Directory -Path prev-extracted -Force
+          Push-Location prev-extracted
+          7z x $prevZip.FullName
+          Pop-Location
+
+          if (Test-Path "prev-extracted/dist/Ghost-Downloader-3.dist") {
+            $oldDir = "prev-extracted/dist/Ghost-Downloader-3.dist"
+          } else {
+            $oldDir = "prev-extracted"
+          }
+
+          $patchFile = "patch-Windows-${{ matrix.architecture }}-${baseVer}-to-${{ env.VERSION }}.hdiff"
+          & "hdiffpatch/${{ matrix.hdiff_arch }}/hdiffz.exe" -f "$oldDir" dist/Ghost-Downloader-3.dist "$patchFile"
+          echo "PATCH_FILE=$patchFile" >> $env:GITHUB_ENV
+
+      - name: Upload to release
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $files = @(
+            "Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}.zip",
+            "dist/Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}-Setup.exe"
+          )
+          if ($env:PATCH_FILE -and (Test-Path $env:PATCH_FILE)) { $files += $env:PATCH_FILE }
+          gh release upload "v${{ env.VERSION }}" @files --clobber
+
+      - name: Upload artifacts
+        if: ${{ github.event.inputs.create_release == 'false' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ghost-Downloader-v${{ env.VERSION }}-Windows-${{ matrix.architecture }}
+          path: |
+            dist/Ghost-Downloader-3.dist
+
+  build-macos:
+    needs: [prepare]
+    if: ${{ github.event.inputs.build_target == 'macos' || github.event.inputs.build_target == 'all' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            runner: macos-15
+            openssl_workaround: 'false'
+          - architecture: x86_64
+            runner: macos-15-intel
+            openssl_workaround: 'true'
+    runs-on: ${{ matrix.runner }}
+    env:
+      SHOULD_SIGN: ${{ github.event.inputs.sign_artifact == 'true' && secrets.APPLE_CERTIFICATE != '' && 'true' || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download HDiffPatch
+        run: |
+          curl -fL "https://github.com/sisong/HDiffPatch/releases/download/v5.1.3/hdiffpatch_v5.1.3_bin_macos.zip" -o hdiffpatch.zip
+          unzip -q hdiffpatch.zip
+
+      - name: Remove problematic brew libs
+        if: ${{ matrix.openssl_workaround == 'true' }}
+        run: |
+          brew remove --force --ignore-dependencies openssl@3
+          brew cleanup openssl@3
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Install dependencies
+        run: |
+          uv python install 3.13
+          uv sync
+
+      - name: Build with Nuitka
+        run: |
+          echo "VERSION=${{ needs.prepare.outputs.version }}" >> "$GITHUB_ENV"
+          uv run scripts/deploy.py
+          # framework Python (setup-python) 构建缺失冻结的 stdlib 子模块（如 http.cookies），
+          # 必须确认链接的是 uv python-build-standalone 的 libpython
+          test -f "dist/Ghost-Downloader-3.app/Contents/MacOS/libpython3.13.dylib"
+          chmod +x "dist/Ghost-Downloader-3.app/Contents/MacOS/Ghost-Downloader-3"
+          rm -rf "dist/Ghost-Downloader-3.build"
+          rm -rf "dist/Ghost-Downloader-3.dist"
+          mv "dist/Ghost-Downloader-3.app" "dist/Ghost Downloader.app"
+          mv "app/assets/修复软件损坏" "dist/修复软件损坏"
+          chmod +x "dist/修复软件损坏"
+
+      - name: Build updater
+        run: |
+          cmake -B build-updater -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.architecture }} tools/updater
+          cmake --build build-updater
+          cp build-updater/updater "dist/Ghost Downloader.app/Contents/MacOS/"
+          cp macos/hpatchz "dist/Ghost Downloader.app/Contents/MacOS/"
+          chmod +x "dist/Ghost Downloader.app/Contents/MacOS/hpatchz"
+
+      - name: Restructure bundle for signing
+        run: uv run scripts/restructure_macos_bundle.py "dist/Ghost Downloader.app"
+
+      - name: Import signing certificate
+        if: ${{ env.SHOULD_SIGN == 'true' }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          rm -f "$CERT_PATH"
+
+      - name: Sign app bundle
+        if: ${{ env.SHOULD_SIGN == 'true' }}
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IDENTITY="Developer ID Application: ${{ secrets.APPLE_SIGN_NAME }} ($APPLE_TEAM_ID)"
+
+          find "dist/Ghost Downloader.app" -type f | while read -r f; do
+            if file -b "$f" | grep -q "Mach-O"; then
+              codesign --force --options runtime --timestamp \
+                --entitlements scripts/entitlements.plist \
+                --sign "$IDENTITY" "$f"
+            fi
+          done
+
+          codesign --force --options runtime --timestamp \
+            --entitlements scripts/entitlements.plist \
+            --sign "$IDENTITY" "dist/Ghost Downloader.app"
+
+          codesign --verify --deep --strict "dist/Ghost Downloader.app"
+          echo "Signing complete."
+
+      - name: Reinstall openssl libs
+        if: ${{ matrix.openssl_workaround == 'true' }}
+        run: |
+          brew install openssl@3
+
+      - name: Install DMG tooling
+        run: |
+          brew list create-dmg >/dev/null 2>&1 || brew install create-dmg
+
+      - name: Create DMG
+        run: |
+          DMG_NAME="Ghost-Downloader-v${{ env.VERSION }}-macOS-${{ matrix.architecture }}.dmg"
+          DMG_SOURCE_DIR="dist/dmg-layout"
+
+          rm -rf "$DMG_SOURCE_DIR"
+          mkdir -p "$DMG_SOURCE_DIR"
+          cp -R "dist/Ghost Downloader.app" "$DMG_SOURCE_DIR/"
+          find "$DMG_SOURCE_DIR" -name ".DS_Store" -delete
+
+          create-dmg \
+            --volname "Ghost Downloader" \
+            --volicon "app/assets/logo.icns" \
+            --background "app/assets/backgroundImage-2X.png" \
+            --window-pos 200 120 \
+            --window-size 664 404 \
+            --icon-size 72 \
+            --text-size 14 \
+            --icon "Ghost Downloader.app" 190 200 \
+            --hide-extension "Ghost Downloader.app" \
+            --app-drop-link 370 200 \
+            --add-file "修复软件损坏" "dist/修复软件损坏" 610 200 \
+            --hdiutil-quiet \
+            --hdiutil-retries 10 \
+            "$DMG_NAME" \
+            "$DMG_SOURCE_DIR"
+
+      - name: Notarize DMG
+        if: ${{ env.SHOULD_SIGN == 'true' }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG_NAME="Ghost-Downloader-v${{ env.VERSION }}-macOS-${{ matrix.architecture }}.dmg"
+          for attempt in 1 2 3; do
+            echo "Notarization attempt $attempt"
+            if xcrun notarytool submit "$DMG_NAME" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --timeout 10m; then
+              break
+            fi
+            [ "$attempt" -eq 3 ] && exit 1
+            echo "Retrying in 30s..."
+            sleep 30
+          done
+          for attempt in 1 2 3; do
+            echo "Stapling attempt $attempt"
+            if xcrun stapler staple -v "$DMG_NAME"; then
+              break
+            fi
+            [ "$attempt" -eq 3 ] && exit 1
+            echo "Retrying in 30s..."
+            sleep 30
+          done
+          echo "Notarization complete."
+
+      - name: Cleanup keychain
+        if: ${{ always() && env.SHOULD_SIGN == 'true' }}
+        run: security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+
+      - name: Generate patch
+        if: ${{ needs.prepare.outputs.patch_base != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x macos/hdiffz
+          BASE_VER="${{ needs.prepare.outputs.patch_base }}"
+
+          mkdir -p prev-download
+          gh release download "v$BASE_VER" -p "*macOS-${{ matrix.architecture }}.dmg" -D prev-download/
+          PREV_DMG=$(ls prev-download/*.dmg | head -1)
+
+          mkdir -p prev-mount
+          hdiutil attach "$PREV_DMG" -mountpoint prev-mount -nobrowse -quiet
+          OLD_APP=$(find prev-mount -maxdepth 1 -name "*.app" | head -1)
+
+          # Strip symlinks from both sides so hdiffz only sees real files.
+          # The updater recreates symlinks after patching (restructureBundle).
+          OLD_COPY="dist/old-for-diff"
+          NEW_COPY="dist/new-for-diff"
+          cp -a "$OLD_APP" "$OLD_COPY"
+          cp -a "dist/Ghost Downloader.app" "$NEW_COPY"
+          find "$OLD_COPY/Contents/MacOS" -type l -delete 2>/dev/null || true
+          find "$NEW_COPY/Contents/MacOS" -type l -delete 2>/dev/null || true
+
+          PATCH_FILE="patch-macOS-${{ matrix.architecture }}-${BASE_VER}-to-${{ env.VERSION }}.hdiff"
+          HDIFF_FLAGS="-f"
+          # Transition: exclude old features/ to avoid corruption from hot-updated packs
+          if [ ! -d "$OLD_COPY/Contents/Resources/features" ]; then
+            HDIFF_FLAGS="$HDIFF_FLAGS -g-old#Contents/MacOS/features/"
+          fi
+          macos/hdiffz $HDIFF_FLAGS "$OLD_COPY" "$NEW_COPY" "$PATCH_FILE"
+
+          hdiutil detach prev-mount -quiet
+          rm -rf "$OLD_COPY" "$NEW_COPY"
+          echo "PATCH_FILE=$PATCH_FILE" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FILES=("Ghost-Downloader-v${{ env.VERSION }}-macOS-${{ matrix.architecture }}.dmg")
+          if [ -n "$PATCH_FILE" ] && [ -f "$PATCH_FILE" ]; then FILES+=("$PATCH_FILE"); fi
+          gh release upload "v${{ env.VERSION }}" "${FILES[@]}" --clobber
+
+      - name: Upload artifacts
+        if: ${{ github.event.inputs.create_release == 'false' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ghost-Downloader-v${{ env.VERSION }}-macOS-${{ matrix.architecture }}
+          path: Ghost-Downloader-v${{ env.VERSION }}-macOS-${{ matrix.architecture }}.dmg
+
+  build-ubuntu:
+    needs: [prepare]
+    if: ${{ github.event.inputs.build_target == 'linux' || github.event.inputs.build_target == 'all' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-22.04
+            appimage_arch: x86_64
+            hdiff_arch: linux64
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            appimage_arch: aarch64
+            hdiff_arch: linux_arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake desktop-file-utils libegl1-mesa-dev libzstd1
+          uv python install 3.13
+          uv sync
+
+      - name: Resolve fcitx5-qt plugin cache key
+        id: fcitx5_meta
+        run: |
+          PYSIDE6_VERSION=$(uv run --no-sync python -c "import PySide6; print(PySide6.__version__)")
+          FCITX5_QT_TAG=$(uv run --no-sync scripts/build_fcitx5_plugin.py --print-tag)
+          echo "pyside6_version=$PYSIDE6_VERSION" >> "$GITHUB_OUTPUT"
+          echo "fcitx5_qt_tag=$FCITX5_QT_TAG" >> "$GITHUB_OUTPUT"
+          echo "PySide6=$PYSIDE6_VERSION fcitx5-qt=$FCITX5_QT_TAG"
+
+      - name: Cache fcitx5-qt plugin
+        id: fcitx5_cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/fcitx5-qt-plugin
+          key: fcitx5-qt-plugin-${{ matrix.architecture }}-${{ steps.fcitx5_meta.outputs.pyside6_version }}-${{ steps.fcitx5_meta.outputs.fcitx5_qt_tag }}
+
+      - name: Build fcitx5-qt plugin
+        if: ${{ steps.fcitx5_cache.outputs.cache-hit != 'true' }}
+        run: |
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            pkg-config \
+            extra-cmake-modules \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libx11-dev \
+            libwayland-dev \
+            libgl-dev \
+            patchelf
+          uv run --no-sync scripts/build_fcitx5_plugin.py \
+            --qt-version "${{ steps.fcitx5_meta.outputs.pyside6_version }}" \
+            --arch "${{ matrix.architecture }}" \
+            --tag "${{ steps.fcitx5_meta.outputs.fcitx5_qt_tag }}" \
+            --output-dir ~/.cache/fcitx5-qt-plugin
+
+      - name: Install fcitx5-qt plugin into PySide6
+        run: |
+          PLUGIN_DIR=$(uv run --no-sync python -c "import PySide6, pathlib; print(pathlib.Path(PySide6.__file__).parent / 'Qt/plugins/platforminputcontexts')")
+          cp ~/.cache/fcitx5-qt-plugin/libfcitx5platforminputcontextplugin.so "$PLUGIN_DIR/"
+
+      - name: Build with Nuitka
+        run: |
+          echo "VERSION=${{ needs.prepare.outputs.version }}" >> "$GITHUB_ENV"
+          uv run scripts/deploy.py
+          chmod +x "dist/Ghost-Downloader-3.dist/Ghost-Downloader-3.bin"
+
+      - name: Verify Linux input method plugins
+        run: |
+          IM_DIR="dist/Ghost-Downloader-3.dist/PySide6/qt-plugins/platforminputcontexts"
+          test -f "$IM_DIR/libfcitx5platforminputcontextplugin.so"
+          test -f "$IM_DIR/libibusplatforminputcontextplugin.so"
+          test -f "$IM_DIR/libcomposeplatforminputcontextplugin.so"
+          test ! -f "$IM_DIR/libqtvirtualkeyboardplugin.so"
+          for plugin in "$IM_DIR"/*.so; do
+            echo "Checking $plugin"
+            LDD_OUT=$(ldd "$plugin")
+            echo "$LDD_OUT"
+            if grep -q "not found" <<< "$LDD_OUT"; then
+              echo "::error::Missing shared library dependency in $plugin"
+              exit 1
+            fi
+          done
+
+      - name: Build .AppImage
+        run: |
+          DIST_DIR="dist/Ghost-Downloader-3.dist"
+          APPDIR="$RUNNER_TEMP/GhostDownloader.AppDir"
+          PACKAGE_NAME="ghost-downloader"
+          DESKTOP_FILE="com.xychr.ghostdownloader.desktop"
+          ICON_FILE="$PACKAGE_NAME.png"
+          APPIMAGE_FILE="dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.AppImage"
+          APPIMAGETOOL_FILE="appimagetool-${{ matrix.appimage_arch }}.AppImage"
+          APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/latest/download/${APPIMAGETOOL_FILE}"
+
+          rm -rf "$APPDIR" "$RUNNER_TEMP/squashfs-root"
+          mkdir -p \
+            "$APPDIR/usr/bin" \
+            "$APPDIR/usr/lib/$PACKAGE_NAME" \
+            "$APPDIR/usr/share/applications" \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+
+          cp -R "$DIST_DIR"/. "$APPDIR/usr/lib/$PACKAGE_NAME/"
+          cp /usr/lib/*/libzstd.so.1 "$APPDIR/usr/lib/$PACKAGE_NAME/"
+
+          ln -s "../lib/$PACKAGE_NAME/Ghost-Downloader-3.bin" "$APPDIR/usr/bin/$PACKAGE_NAME"
+          ln -s "usr/bin/$PACKAGE_NAME" "$APPDIR/AppRun"
+
+          cat > "$APPDIR/usr/share/applications/$DESKTOP_FILE" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=Ghost Downloader
+          Comment=The only downloader you need
+          Exec=$PACKAGE_NAME %U
+          Icon=$PACKAGE_NAME
+          Terminal=false
+          Categories=Network;Utility;
+          StartupNotify=false
+          EOF
+
+          cp "app/assets/logo.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/$ICON_FILE"
+
+          ln -s "usr/share/applications/$DESKTOP_FILE" "$APPDIR/$DESKTOP_FILE"
+          ln -s "usr/share/icons/hicolor/256x256/apps/$ICON_FILE" "$APPDIR/$ICON_FILE"
+          ln -s "usr/share/icons/hicolor/256x256/apps/$ICON_FILE" "$APPDIR/.DirIcon"
+
+          desktop-file-validate "$APPDIR/usr/share/applications/$DESKTOP_FILE"
+
+          curl -fL "$APPIMAGETOOL_URL" -o "$RUNNER_TEMP/$APPIMAGETOOL_FILE"
+          chmod +x "$RUNNER_TEMP/$APPIMAGETOOL_FILE"
+          (
+            cd "$RUNNER_TEMP"
+            "./$APPIMAGETOOL_FILE" --appimage-extract >/dev/null
+            ARCH="${{ matrix.appimage_arch }}" \
+              ./squashfs-root/AppRun \
+              --no-appstream \
+              "$APPDIR" \
+              "$GITHUB_WORKSPACE/$APPIMAGE_FILE"
+          )
+          chmod +x "$APPIMAGE_FILE"
+
+          file "$APPIMAGE_FILE"
+
+      - name: Build updater
+        run: |
+          cmake -B build-updater -DCMAKE_BUILD_TYPE=Release tools/updater
+          cmake --build build-updater
+          cp build-updater/updater dist/Ghost-Downloader-3.dist/
+
+      - name: Download HDiffPatch
+        run: |
+          curl -fsSL "https://github.com/sisong/HDiffPatch/releases/download/v5.1.3/hdiffpatch_v5.1.3_bin_${{ matrix.hdiff_arch }}.zip" -o hdiffpatch.zip
+          python3 -m zipfile -e hdiffpatch.zip hdiffpatch
+          chmod +x "hdiffpatch/${{ matrix.hdiff_arch }}/hdiffz" "hdiffpatch/${{ matrix.hdiff_arch }}/hpatchz"
+          cp "hdiffpatch/${{ matrix.hdiff_arch }}/hpatchz" dist/Ghost-Downloader-3.dist/
+
+      - name: Tar the contents of Ghost-Downloader
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        run: |
+          cp app/assets/logo.png dist/Ghost-Downloader-3.dist/logo.png
+          TAR_FILE="Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.tar.xz"
+          echo "Creating tar.xz archive of dist/Ghost-Downloader-3.dist..."
+          tar -cJf "$TAR_FILE" -C dist/Ghost-Downloader-3.dist .
+          echo "Archive created at $TAR_FILE"
+
+      - name: Generate patch
+        if: ${{ needs.prepare.outputs.patch_base != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE_VER="${{ needs.prepare.outputs.patch_base }}"
+          BASE_TAR="Ghost-Downloader-v${BASE_VER}-Linux-${{ matrix.architecture }}.tar.xz"
+          if ! gh release view "v$BASE_VER" --json assets --jq '.assets[].name' | grep -Fxq "$BASE_TAR"; then
+            echo "v$BASE_VER has no Linux-${{ matrix.architecture }} package, skipping patch"
+            exit 0
+          fi
+
+          mkdir -p prev-download prev-dir
+          gh release download "v$BASE_VER" -p "$BASE_TAR" -D prev-download/
+          tar -xJf "prev-download/$BASE_TAR" -C prev-dir
+          PATCH_FILE="patch-Linux-${{ matrix.architecture }}-${BASE_VER}-to-${{ env.VERSION }}.hdiff"
+          "hdiffpatch/${{ matrix.hdiff_arch }}/hdiffz" -f prev-dir dist/Ghost-Downloader-3.dist "$PATCH_FILE"
+          rm -rf prev-download prev-dir
+          echo "PATCH_FILE=$PATCH_FILE" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FILES=(
+            "Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.tar.xz"
+            "dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.AppImage"
+          )
+          if [ -n "${PATCH_FILE:-}" ] && [ -f "$PATCH_FILE" ]; then FILES+=("$PATCH_FILE"); fi
+          gh release upload "v${{ env.VERSION }}" "${FILES[@]}" --clobber
+
+      - name: Upload artifacts
+        if: ${{ github.event.inputs.create_release == 'false' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}
+          path: |
+            dist/Ghost-Downloader-3.dist
+            dist/Ghost-Downloader-v${{ env.VERSION }}-Linux-${{ matrix.architecture }}.AppImage
+
+  android-libtorrent:
+    if: ${{ github.event.inputs.build_target == 'android' || github.event.inputs.build_target == 'all' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: XiaoYouChR/Ghost-Downloader-Android
+          token: ${{ secrets.ANDROID_REPO_TOKEN }}
+          path: android
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Resolve libtorrent wheel versions
+        id: libtorrent
+        working-directory: android/build-scripts
+        run: echo "versions=$(./build_libtorrent_wheel.sh --print-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libtorrent wheel
+        id: libtorrent-cache
+        uses: actions/cache@v6
+        with:
+          path: android/build-scripts/dist
+          key: libtorrent-android-arm64-v8a-${{ steps.libtorrent.outputs.versions }}-${{ hashFiles('android/build-scripts/build_libtorrent_wheel.sh') }}
+
+      - name: Install wheel tool
+        if: ${{ steps.libtorrent-cache.outputs.cache-hit != 'true' }}
+        run: pip install wheel
+
+      - name: Build libtorrent wheel
+        if: ${{ steps.libtorrent-cache.outputs.cache-hit != 'true' }}
+        working-directory: android/build-scripts
+        run: ./build_libtorrent_wheel.sh --abi=arm64-v8a
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libtorrent-arm64-v8a
+          path: android/build-scripts/dist/libtorrent-*.whl
+
+  android-wreq:
+    if: ${{ github.event.inputs.build_target == 'android' || github.event.inputs.build_target == 'all' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: XiaoYouChR/Ghost-Downloader-Android
+          token: ${{ secrets.ANDROID_REPO_TOKEN }}
+          path: android
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Install tools
+        run: pip install lief wheel
+
+      - name: Patch wreq wheel
+        working-directory: android/build-scripts
+        run: ./patch_wreq_wheel.sh --abi=arm64-v8a
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wreq-arm64-v8a
+          path: android/build-scripts/dist/wreq-*.whl
+
+  android-kelpie:
+    if: ${{ github.event.inputs.build_target == 'android' || github.event.inputs.build_target == 'all' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: XiaoYouChR/Ghost-Downloader-Android
+          token: ${{ secrets.ANDROID_REPO_TOKEN }}
+          path: android
+
+      - uses: actions/checkout@v7
+        with:
+          repository: XiaoYouChR/Kelpie
+          path: Kelpie
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: Kelpie/go.mod
+
+      - name: Build Kelpie
+        working-directory: android/build-scripts
+        env:
+          KELPIE_SRC: ${{ github.workspace }}/Kelpie
+        run: ./build_kelpie.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kelpie-arm64-v8a
+          path: android/app/src/main/jniLibs/arm64-v8a/libkelpie.so
+
+  android-native-libs:
+    if: ${{ github.event.inputs.build_target == 'android' || github.event.inputs.build_target == 'all' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: XiaoYouChR/Ghost-Downloader-Android
+          token: ${{ secrets.ANDROID_REPO_TOKEN }}
+          path: android
+
+      - name: Fetch pre-built binaries
+        working-directory: android/build-scripts
+        run: ./fetch_android_libs.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-libs-arm64-v8a
+          path: android/app/src/main/jniLibs/arm64-v8a
+
+  build-android:
+    needs: [prepare, android-libtorrent, android-wreq, android-kelpie, android-native-libs]
+    if: ${{ github.event.inputs.build_target == 'android' || github.event.inputs.build_target == 'all' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && 'true' || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: XiaoYouChR/Ghost-Downloader-Android
+          token: ${{ secrets.ANDROID_REPO_TOKEN }}
+          path: android
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost /usr/local/share/powershell /opt/hostedtoolcache/CodeQL \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: libtorrent-arm64-v8a
+          path: android/build-scripts/dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: wreq-arm64-v8a
+          path: android/build-scripts/dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: kelpie-arm64-v8a
+          path: android/app/src/main/jniLibs/arm64-v8a
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: native-libs-arm64-v8a
+          path: android/app/src/main/jniLibs/arm64-v8a
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Write keystore.properties
+        if: ${{ env.HAS_KEYSTORE == 'true' }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          cat > android/keystore.properties <<EOF
+          storeFile=$RUNNER_TEMP/release.jks
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEYSTORE_PASSWORD
+          EOF
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          if [ "$HAS_KEYSTORE" = 'true' ]; then
+            echo "APK_VARIANT=release" >> "$GITHUB_ENV"
+            ./gradlew :app:assembleRelease
+          else
+            echo "APK_VARIANT=debug" >> "$GITHUB_ENV"
+            ./gradlew :app:assembleDebug
+          fi
+
+      - name: Rename APK
+        run: |
+          APK=$(ls android/app/build/outputs/apk/"$APK_VARIANT"/*.apk)
+          DEST="Ghost-Downloader-v${{ needs.prepare.outputs.version }}-Android-arm64-v8a.apk"
+          mv "$APK" "$DEST"
+          echo "APK_FILE=$DEST" >> "$GITHUB_ENV"
+
+      - name: Generate patch
+        if: ${{ needs.prepare.outputs.patch_base != '' && env.HAS_KEYSTORE == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE_VER="${{ needs.prepare.outputs.patch_base }}"
+          BASE_APK="Ghost-Downloader-v${BASE_VER}-Android-arm64-v8a.apk"
+          if ! gh release view "v$BASE_VER" --json assets --jq '.assets[].name' | grep -Fxq "$BASE_APK"; then
+            echo "v$BASE_VER has no Android-arm64 APK, skipping patch"
+            exit 0
+          fi
+
+          curl -fL "https://github.com/sisong/HDiffPatch/releases/download/v5.1.3/hdiffpatch_v5.1.3_bin_linux64.zip" -o hdiffpatch.zip
+          unzip -q hdiffpatch.zip -d hdiffpatch
+          chmod +x hdiffpatch/linux64/hdiffz
+
+          mkdir -p prev
+          gh release download "v$BASE_VER" -p "$BASE_APK" -D prev/
+
+          PATCH_FILE="patch-Android-arm64-${BASE_VER}-to-${{ needs.prepare.outputs.version }}.hdiff"
+          hdiffpatch/linux64/hdiffz -f -c-lzma2 "prev/$BASE_APK" "${{ env.APK_FILE }}" "$PATCH_FILE"
+          echo "PATCH_FILE=$PATCH_FILE" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FILES=("${{ env.APK_FILE }}")
+          if [ -n "$PATCH_FILE" ] && [ -f "$PATCH_FILE" ]; then FILES+=("$PATCH_FILE"); fi
+          gh release upload "v${{ needs.prepare.outputs.version }}" "${FILES[@]}" --clobber
+
+      - name: Upload APK artifact
+        if: ${{ github.event.inputs.create_release == 'false' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ghost-Downloader-v${{ needs.prepare.outputs.version }}-Android-arm64-v8a
+          path: ${{ env.APK_FILE }}
+          if-no-files-found: error
+
+  finalize:
+    needs: [prepare, build-windows, build-macos, build-ubuntu, build-android]
+    if: ${{ always() && github.event.inputs.create_release == 'true' && needs.prepare.result == 'success' && !contains(fromJSON('["failure","cancelled"]'), needs.build-windows.result) && !contains(fromJSON('["failure","cancelled"]'), needs.build-macos.result) && !contains(fromJSON('["failure","cancelled"]'), needs.build-ubuntu.result) && !contains(fromJSON('["failure","cancelled"]'), needs.build-android.result) && (needs.build-windows.result == 'success' || needs.build-macos.result == 'success' || needs.build-ubuntu.result == 'success' || needs.build-android.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Build pack zips
+        run: uv run --no-project python3 scripts/build_pack.py --bumped
+
+      - name: Generate versions.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREV_VER: ${{ needs.prepare.outputs.patch_base }}
+        run: |
+          mkdir -p assets
+          gh release download "v${VERSION}" --repo ${{ github.repository }} -p "*.hdiff" -p "*.zip" -p "*.dmg" -p "*.tar.xz" -p "*.AppImage" -p "*.apk" -p "*.exe" -D assets/ 2>/dev/null || true
+
+          uv run --no-project python3 << 'PYEOF'
+          import hashlib, json, os
+
+          version = os.environ["VERSION"]
+          prev_ver = os.environ.get("PREV_VER", "")
+          assets_dir = "assets"
+
+          def sha256of(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          full_suffix = {
+              "Windows-x86_64": "Windows-x86_64.zip",
+              "Windows-arm64": "Windows-arm64.zip",
+              "macOS-arm64": "macOS-arm64.dmg",
+              "macOS-x86_64": "macOS-x86_64.dmg",
+              "Linux-x86_64": "Linux-x86_64.tar.xz",
+              "Linux-arm64": "Linux-arm64.tar.xz",
+              "Android-arm64": "Android-arm64-v8a.apk",
+          }
+          patches = {}
+          full = {}
+
+          for p, suffix_name in full_suffix.items():
+              for f in os.listdir(assets_dir):
+                  if f.startswith(f"patch-{p}-") and f.endswith(".hdiff"):
+                      path = os.path.join(assets_dir, f)
+                      prefix, suffix = f"patch-{p}-", f"-to-{version}.hdiff"
+                      from_ver = f[len(prefix):-len(suffix)] if f.endswith(suffix) else prev_ver
+                      patches[p] = {"from": from_ver, "file": f, "sha256": sha256of(path), "size": os.path.getsize(path)}
+                      break
+
+              full_name = f"Ghost-Downloader-v{version}-{suffix_name}"
+              full_path = os.path.join(assets_dir, full_name)
+              if os.path.isfile(full_path):
+                  full[p] = {"file": full_name, "sha256": sha256of(full_path), "size": os.path.getsize(full_path)}
+
+          with open("versions.json") as f:
+              data = json.load(f)
+
+          data["app"] = {"version": version, "patches": patches, "full": full}
+
+          with open("versions.json", "w") as f:
+              json.dump(data, f, indent=2)
+          print(json.dumps(data, indent=2))
+          PYEOF
+
+      - name: Commit versions.json
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add versions.json dist/packs/
+          git diff --staged --quiet || git commit -m "chore: update versions.json for v${VERSION} [skip ci]"
+          git pull --rebase
+          git push
+
+      - name: Push to CNB
+        continue-on-error: true
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [ -z "$CNB_TOKEN" ]; then echo "No CNB_TOKEN, skipping"; exit 0; fi
+          git fetch origin tag "v${VERSION}"
+          REMOTE="https://cnb:${CNB_TOKEN}@cnb.cool/XiaoYouChR/Ghost-Downloader-3"
+          git push "$REMOTE" main 2>&1 | sed "s/${CNB_TOKEN}/****/g" || true
+
+      - name: Route GitCode to HK server
+        run: |
+          sudo tee -a /etc/hosts >/dev/null <<'HOSTS'
+          159.138.147.37 gitcode.com
+          159.138.147.37 api.gitcode.com
+          159.138.147.37 file.gitcode.com
+          159.138.147.37 api.atomgit.com
+          159.138.147.37 file.atomgit.com
+          HOSTS
+
+      - name: Push to GitCode
+        continue-on-error: true
+        env:
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [ -z "$GITCODE_TOKEN" ]; then echo "No GITCODE_TOKEN, skipping"; exit 0; fi
+          git fetch origin tag "v${VERSION}"
+          REMOTE="https://XiaoYouChR:${GITCODE_TOKEN}@gitcode.com/XiaoYouChR/Ghost-Downloader-3.git"
+          git push "$REMOTE" main "v${VERSION}" 2>&1 | sed "s/${GITCODE_TOKEN}/****/g" || true
+
+      - name: Mirror release to GitCode
+        continue-on-error: true
+        env:
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if [ -z "$GITCODE_TOKEN" ]; then echo "No GITCODE_TOKEN, skipping mirror"; exit 0; fi
+
+          API="https://api.gitcode.com/api/v5"
+          REPO="XiaoYouChR/Ghost-Downloader-3"
+          TAG="v${VERSION}"
+          AUTH="access_token=${GITCODE_TOKEN}"
+
+          curl -fsS -X POST "${API}/repos/${REPO}/releases?${AUTH}" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":\"${TAG}\"}" \
+            -o /dev/null || echo "Release already exists"
+
+          curl -fsS -X PATCH "${API}/repos/${REPO}/releases/${TAG}?${AUTH}" \
+            -H "Content-Type: application/json" \
+            -d '{"release_status":"latest"}' \
+            -o /dev/null || true
+
+          upload_file() {
+            local file="$1"
+            local name=$(basename "$file")
+            echo "uploading: $name"
+
+            local upload_info
+            upload_info=$(curl -fsS "${API}/repos/${REPO}/releases/${TAG}/upload_url?${AUTH}&file_name=${name}")
+            local url=$(echo "$upload_info" | jq -r '.url')
+            local content_type=$(echo "$upload_info" | jq -r '.headers["Content-Type"]')
+            local meta_project=$(echo "$upload_info" | jq -r '.headers["x-obs-meta-project-id"]')
+            local obs_acl=$(echo "$upload_info" | jq -r '.headers["x-obs-acl"]')
+            local obs_callback=$(echo "$upload_info" | jq -r '.headers["x-obs-callback"]')
+
+            curl -fsS -X PUT "$url" \
+              -H "Content-Type: ${content_type}" \
+              -H "x-obs-meta-project-id: ${meta_project}" \
+              -H "x-obs-acl: ${obs_acl}" \
+              -H "x-obs-callback: ${obs_callback}" \
+              --data-binary "@${file}" \
+              -o /dev/null \
+              -w "uploaded: ${name}  http=%{http_code}  bytes=%{size_upload}  time=%{time_total}s\n"
+          }
+
+          # GitCode 并发上传偶尔返回 502
+          upload_with_retry() {
+            for attempt in 1 2 3; do
+              upload_file "$1" && return 0
+              sleep 5
+            done
+            echo "$1" >> failed.txt
+          }
+
+          rm -f failed.txt
+          for f in assets/patch-*.hdiff assets/Ghost-Downloader-v${VERSION}-*; do
+            [ -f "$f" ] && upload_with_retry "$f" &
+          done
+          wait
+
+          if [ -f failed.txt ]; then
+            echo "Failed to upload:"
+            cat failed.txt
+            exit 1
+          fi
+
